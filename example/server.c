@@ -6,8 +6,8 @@
 #include "../include/raft.h"
 #include "../include/raft/uv.h"
 
-#define N_SERVERS 3    /* Number of servers in the example cluster */
-#define APPLY_RATE 125 /* Apply a new entry every 125 milliseconds */
+#define N_SERVERS 3     /* Number of servers in the example cluster */
+#define APPLY_RATE 1000 /* Apply a new entry every 125 milliseconds */
 
 #define Log(SERVER_ID, FORMAT) printf("%d: " FORMAT "\n", SERVER_ID)
 #define Logf(SERVER_ID, FORMAT, ...) \
@@ -100,11 +100,22 @@ static void FsmClose(struct raft_fsm *f)
 struct Server;
 typedef void (*ServerCloseCb)(struct Server *server);
 
+/* A single client-submitted command, queued for the loop thread to hand off
+ * to raft_apply(). Lives on the caller's stack for the lifetime of the
+ * blocking ServerSubmit() call. */
+struct ClientRequest
+{
+    struct raft_buffer buf;
+    uv_sem_t done;
+    int status;
+    uint64_t result;
+    struct ClientRequest *next;
+};
+
 struct Server
 {
     void *data;                         /* User data context. */
     struct uv_loop_s *loop;             /* UV loop. */
-    struct uv_timer_s timer;            /* To periodically apply a new entry. */
     const char *dir;                    /* Data dir of UV I/O backend. */
     struct raft_uv_transport transport; /* UV I/O backend transport. */
     struct raft_io io;                  /* UV I/O backend. */
@@ -114,7 +125,123 @@ struct Server
     struct raft raft;                   /* Raft instance. */
     struct raft_transfer transfer;      /* Transfer leadership request. */
     ServerCloseCb close_cb;             /* Optional close callback. */
+
+    /* Cross-thread command submission. */
+    uv_async_t submit_async; /* Wakes the loop to drain the queue. */
+    uv_mutex_t queue_mutex;  /* Protects the fields below. */
+    struct ClientRequest *queue_head;
+    struct ClientRequest *queue_tail;
+    int stopping; /* Set once shutdown has begun. */
+
+    uv_thread_t submit_thread; /* Demo thread submitting commands. */
+    int thread_started;
+    uv_work_t join_work; /* Used to join submit_thread off-loop. */
 };
+
+/* Runs on the loop thread: completion callback for a raft_apply() issued on
+ * behalf of a ClientRequest. Hands the outcome back to the blocked caller. */
+static void serverClientApplyCb(struct raft_apply *req,
+                                int status,
+                                void *result)
+{
+    struct ClientRequest *creq = req->data;
+    raft_free(req);
+    creq->status = status;
+    if (status == 0) {
+        creq->result = *(uint64_t *)result;
+    }
+    uv_sem_post(&creq->done);
+}
+
+/* Runs on the loop thread: woken up by ServerSubmit() from any thread. Drains
+ * the queue and issues one raft_apply() per queued request. */
+static void serverSubmitAsyncCb(uv_async_t *handle)
+{
+    struct Server *s = handle->data;
+    struct ClientRequest *creq;
+
+    uv_mutex_lock(&s->queue_mutex);
+    creq = s->queue_head;
+    s->queue_head = NULL;
+    s->queue_tail = NULL;
+    uv_mutex_unlock(&s->queue_mutex);
+
+    while (creq != NULL) {
+        struct ClientRequest *next = creq->next;
+        struct raft_apply *req;
+        int rv;
+
+        if (s->raft.state != RAFT_LEADER) {
+            creq->status = RAFT_NOTLEADER;
+            uv_sem_post(&creq->done);
+            creq = next;
+            continue;
+        }
+
+        req = raft_malloc(sizeof *req);
+        if (req == NULL) {
+            creq->status = RAFT_NOMEM;
+            uv_sem_post(&creq->done);
+            creq = next;
+            continue;
+        }
+        req->data = creq;
+
+        rv = raft_apply(&s->raft, req, &creq->buf, 1, serverClientApplyCb);
+        if (rv != 0) {
+            raft_free(req);
+            creq->status = rv;
+            uv_sem_post(&creq->done);
+        }
+
+        creq = next;
+    }
+}
+
+/* Thread-safe: submit a new command from any thread and block until raft has
+ * applied it (or failed to). Multiple threads may call this concurrently. */
+static int ServerSubmit(struct Server *s, uint64_t value, uint64_t *result)
+{
+    struct ClientRequest creq;
+    int rv;
+
+    creq.buf.len = sizeof(uint64_t);
+    creq.buf.base = raft_malloc(creq.buf.len);
+    if (creq.buf.base == NULL) {
+        return RAFT_NOMEM;
+    }
+    *(uint64_t *)creq.buf.base = value;
+    creq.next = NULL;
+    creq.status = 0;
+    creq.result = 0;
+    uv_sem_init(&creq.done, 0);
+
+    uv_mutex_lock(&s->queue_mutex);
+    if (s->stopping) {
+        uv_mutex_unlock(&s->queue_mutex);
+        uv_sem_destroy(&creq.done);
+        raft_free(creq.buf.base);
+        return RAFT_SHUTDOWN;
+    }
+    if (s->queue_tail != NULL) {
+        s->queue_tail->next = &creq;
+    } else {
+        s->queue_head = &creq;
+    }
+    s->queue_tail = &creq;
+    uv_mutex_unlock(&s->queue_mutex);
+
+    uv_async_send(&s->submit_async);
+
+    uv_sem_wait(&creq.done);
+    uv_sem_destroy(&creq.done);
+
+    rv = creq.status;
+    if (rv == 0 && result != NULL) {
+        *result = creq.result;
+    }
+    return rv;
+}
 
 static void serverRaftCloseCb(struct raft *raft)
 {
@@ -122,6 +249,7 @@ static void serverRaftCloseCb(struct raft *raft)
     raft_uv_close(&s->io);
     raft_uv_tcp_close(&s->transport);
     FsmClose(&s->fsm);
+    uv_mutex_destroy(&s->queue_mutex);
     if (s->close_cb != NULL) {
         s->close_cb(s);
     }
@@ -136,9 +264,9 @@ static void serverTransferCb(struct raft_transfer *req)
     raft_close(&s->raft, serverRaftCloseCb);
 }
 
-/* Final callback in the shutdown sequence, invoked after the timer handle has
- * been closed. */
-static void serverTimerCloseCb(struct uv_handle_s *handle)
+/* Final callback in the shutdown sequence, invoked once submit_async has been
+ * fully closed (guaranteeing no more queued commands can arrive). */
+static void serverSubmitAsyncCloseCb(struct uv_handle_s *handle)
 {
     struct Server *s = handle->data;
     if (s->raft.data != NULL) {
@@ -151,6 +279,21 @@ static void serverTimerCloseCb(struct uv_handle_s *handle)
         }
         raft_close(&s->raft, serverRaftCloseCb);
     }
+}
+
+/* Runs on a libuv thread-pool worker so that joining the submit thread never
+ * blocks the loop thread it may itself be waiting on. */
+static void serverJoinWorkCb(uv_work_t *work)
+{
+    struct Server *s = work->data;
+    uv_thread_join(&s->submit_thread);
+}
+
+static void serverJoinAfterWorkCb(uv_work_t *work, int status)
+{
+    struct Server *s = work->data;
+    (void)status;
+    uv_close((struct uv_handle_s *)&s->submit_async, serverSubmitAsyncCloseCb);
 }
 
 /* Initialize the example server struct, without starting it yet. */
@@ -172,13 +315,22 @@ static int ServerInit(struct Server *s,
 
     s->loop = loop;
 
-    /* Add a timer to periodically try to propose a new entry. */
-    rv = uv_timer_init(s->loop, &s->timer);
+    /* Set up the cross-thread command submission queue. */
+    rv = uv_async_init(s->loop, &s->submit_async, serverSubmitAsyncCb);
     if (rv != 0) {
-        Logf(s->id, "uv_timer_init(): %s", uv_strerror(rv));
+        Logf(s->id, "uv_async_init(): %s", uv_strerror(rv));
         goto err;
     }
-    s->timer.data = s;
+    rv = uv_mutex_init(&s->queue_mutex);
+    if (rv != 0) {
+        Logf(s->id, "uv_mutex_init(): %s", uv_strerror(rv));
+        goto err;
+    }
+    /* Only mark submit_async as ready once the mutex it depends on is also
+     * initialized; ServerClose() uses submit_async.data as the guard for
+     * whether this whole subsystem needs tearing down. */
+    s->submit_async.data = s;
+    s->join_work.data = s;
 
     /* Initialize the TCP-based RPC transport. */
     s->transport.version = 1;
@@ -255,58 +407,28 @@ err:
     return rv;
 }
 
-/* Called after a request to apply a new command to the FSM has been
- * completed. */
-static void serverApplyCb(struct raft_apply *req, int status, void *result)
+/* Demo external thread: outside the loop, periodically submits a command and
+ * blocks on ServerSubmit() for the result, exactly like any other caller
+ * would from an independent thread (e.g. an HTTP handler). */
+static void serverSubmitterMain(void *arg)
 {
-    struct Server *s = req->data;
-    int count;
-    raft_free(req);
-    if (status != 0) {
-        if (status != RAFT_LEADERSHIPLOST) {
-            Logf(s->id, "raft_apply() callback: %s (%d)", raft_errmsg(&s->raft),
-                 status);
+    struct Server *s = arg;
+
+    for (;;) {
+        uint64_t result;
+        int rv;
+
+        uv_sleep(APPLY_RATE);
+
+        rv = ServerSubmit(s, 1, &result);
+        if (rv == RAFT_SHUTDOWN) {
+            break;
         }
-        return;
-    }
-    count = *(int *)result;
-    if (count % 100 == 0) {
-        Logf(s->id, "count %d", count);
-    }
-}
-
-/* Called periodically every APPLY_RATE milliseconds. */
-static void serverTimerCb(uv_timer_t *timer)
-{
-    struct Server *s = timer->data;
-    struct raft_buffer buf;
-    struct raft_apply *req;
-    int rv;
-
-    if (s->raft.state != RAFT_LEADER) {
-        return;
-    }
-
-    buf.len = sizeof(uint64_t);
-    buf.base = raft_malloc(buf.len);
-    if (buf.base == NULL) {
-        Log(s->id, "serverTimerCb(): out of memory");
-        return;
-    }
-
-    *(uint64_t *)buf.base = 1;
-
-    req = raft_malloc(sizeof *req);
-    if (req == NULL) {
-        Log(s->id, "serverTimerCb(): out of memory");
-        return;
-    }
-    req->data = s;
-
-    rv = raft_apply(&s->raft, req, &buf, 1, serverApplyCb);
-    if (rv != 0) {
-        Logf(s->id, "raft_apply(): %s", raft_errmsg(&s->raft));
-        return;
+        if (rv != 0) {
+            Logf(s->id, "ServerSubmit(): %s", raft_strerror(rv));
+            continue;
+        }
+        Logf(s->id, "count %llu", (unsigned long long)result);
     }
 }
 
@@ -322,11 +444,12 @@ static int ServerStart(struct Server *s)
         Logf(s->id, "raft_start(): %s", raft_errmsg(&s->raft));
         goto err;
     }
-    rv = uv_timer_start(&s->timer, serverTimerCb, 0, 125);
+    rv = uv_thread_create(&s->submit_thread, serverSubmitterMain, s);
     if (rv != 0) {
-        Logf(s->id, "uv_timer_start(): %s", uv_strerror(rv));
+        Logf(s->id, "uv_thread_create(): %s", uv_strerror(rv));
         goto err;
     }
+    s->thread_started = 1;
 
     return 0;
 
@@ -341,12 +464,31 @@ static void ServerClose(struct Server *s, ServerCloseCb cb)
 
     Log(s->id, "stopping");
 
-    /* Close the timer asynchronously if it was successfully
-     * initialized. Otherwise invoke the callback immediately. */
-    if (s->timer.data != NULL) {
-        uv_close((struct uv_handle_s *)&s->timer, serverTimerCloseCb);
-    } else {
-        s->close_cb(s);
+    if (s->submit_async.data == NULL) {
+        /* ServerInit() never got this far; nothing to tear down. */
+        if (s->close_cb != NULL) {
+            s->close_cb(s);
+        }
+        return;
+    }
+
+    uv_mutex_lock(&s->queue_mutex);
+    s->stopping = 1;
+    uv_mutex_unlock(&s->queue_mutex);
+
+    if (!s->thread_started) {
+        uv_close((struct uv_handle_s *)&s->submit_async,
+                 serverSubmitAsyncCloseCb);
+        return;
+    }
+
+    /* Join off the loop thread: the submit thread may currently be blocked in
+     * ServerSubmit() waiting on an in-flight raft_apply(), which can only
+     * complete while the loop keeps running. */
+    if (uv_queue_work(s->loop, &s->join_work, serverJoinWorkCb,
+                      serverJoinAfterWorkCb) != 0) {
+        uv_close((struct uv_handle_s *)&s->submit_async,
+                 serverSubmitAsyncCloseCb);
     }
 }
 
